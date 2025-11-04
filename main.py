@@ -78,9 +78,9 @@ def classify_by_year(data):
 
     for item in data:
         date_str = str(item.get("Date") or item.get("date") or "").strip()
-        year = "Unknown"
+        year = "2015"
 
-        if not date_str or date_str.lower() == "unknown":
+        if not date_str or date_str.lower() == "2015":
             year_counts[year] += 1
             continue
 
@@ -103,7 +103,7 @@ def classify_by_year(data):
                 yy = int(parts[-1])
                 year = str(2000 + yy) if yy < 50 else str(1900 + yy)
             else:
-                year = "Unknown"
+                year = "2015"
 
         year_counts[year] += 1
 
@@ -112,19 +112,20 @@ def classify_by_year(data):
 
 def classify_by_cause(data):
     """
-    Use Gemini to classify accidents by cause (from Description text).
-    Fallback to dataset's 'Cause' field if no Gemini key available.
+    Robust classifier for accident causes.
+    - If explicit 'Cause' (or 'cause') field exists, use it.
+    - Else, inspect textual fields (Description, Narrative, Accident Details, Summary, Remarks)
+      and classify using keyword heuristics.
+    - Returns:
+      {
+        "counts": { category: int, ... },
+        "examples": { category: [ {idx, snippet, full_record}, ... ] }
+      }
+    - If `llm` is configured and you want to force LLM-based classification, you can call
+      the LLM branch by setting USE_LLM=True (not default).
     """
-    # If Gemini is not configured, fallback to manual field-based counting
-    if not llm:
-        cause_counts = defaultdict(int)
-        for item in data:
-            cause = item.get("Cause") or item.get("cause") or "Unknown"
-            cause_counts[cause] += 1
-        return dict(cause_counts)
-
-    # Predefined cause categories for Gemini classification
-    cause_labels = [
+    # categories used previously
+    categories = [
         "Fall of Roof",
         "Machinery Accident",
         "Explosion",
@@ -134,26 +135,140 @@ def classify_by_cause(data):
         "Other"
     ]
 
-    # Limit sample size for efficiency
+    # keyword -> category mapping (lowercase)
+    keyword_map = {
+        "fall of roof": "Fall of Roof",
+        "roof fall": "Fall of Roof",
+        "fall of side": "Fall of Roof",
+        "slip": "Fall of Roof",
+        "collapse": "Fall of Roof",
+        "machine": "Machinery Accident",
+        "machinery": "Machinery Accident",
+        "crush": "Machinery Accident",
+        "caught in": "Machinery Accident",
+        "entangled": "Machinery Accident",
+        "explosion": "Explosion",
+        "blast": "Explosion",
+        "gas": "Explosion",
+        "electr": "Electrical Accident",   # matches electrical, electricity, etc
+        "short circuit": "Electrical Accident",
+        "fire": "Fire Incident",
+        "burn": "Fire Incident",
+        "transport": "Transportation Accident",
+        "vehicle": "Transportation Accident",
+        "truck": "Transportation Accident",
+        "trolley": "Transportation Accident",
+        "collision": "Transportation Accident",
+        "diesel": "Machinery Accident",
+        "compressor": "Machinery Accident",
+        "fall from": "Fall of Roof",
+        "fall": "Fall of Roof",
+        "gas leak": "Explosion",
+        "methane": "Explosion",
+        "oxygen deficiency": "Explosion",
+        "inrush": "Fall of Roof",
+    }
 
-    prompt = f"""
-    You are a mining accident analysis expert.
-    Given the following accident records, classify each accident by its CAUSE using these categories:
-    {', '.join(cause_labels)}.
+    # helper to extract text content from a record
+    def extract_text_fields(rec):
+        texts = []
+        for k in ("Cause", "cause", "Description", "description", "Narrative", "narrative", 
+                  "Accident Details", "accident_details", "Summary", "summary", "Remarks", "remarks"):
+            if k in rec and rec.get(k):
+                texts.append(str(rec.get(k)))
+        # also join all values as fallback
+        if not texts:
+            # small fallback: join a few fields
+            for k in ("Details", "details", "Remarks", "remarks"):
+                if k in rec and rec.get(k):
+                    texts.append(str(rec.get(k)))
+        return " ".join(texts).strip()
 
-    Return the result as a JSON object where each key is a cause and each value is the count.
+    counts = defaultdict(int)
+    examples = {cat: [] for cat in categories}
 
-    Here are the records:
-    {json.dumps(data, indent=2)}
-    """
-    try:
-        response = llm.complete(prompt)
-        text = response.text.strip()
-        result = json.loads(text)
-        return result
-    except Exception as e:
-        print("⚠️ Gemini classification failed:", e)
-        return {"error": "Gemini classification failed", "fallback": True}
+    # Optionally use LLM if configured and desired (disabled by default)
+    USE_LLM = False
+
+    if USE_LLM and llm:
+        # Build a small prompt to classify - but keep it limited to avoid rate limits
+        # We'll call LLM on batches to get predicted categories, fallback to heuristic for failures
+        try:
+            # prepare a small JSON input with index and text snippet
+            sample_payload = []
+            for idx, rec in enumerate(data):
+                txt = extract_text_fields(rec)
+                sample_payload.append({"idx": idx, "text": txt[:1000]})
+            prompt = f"""You are an expert mining safety analyst. Classify each record into one of these categories: {', '.join(categories)}.
+            Return a JSON list of objects like: {{ "idx": <index>, "category": "<one of categories>" }}.
+            Here are the records: {json.dumps(sample_payload)}"""
+            resp = llm.complete(prompt)
+            text = resp.text.strip()
+            mapped = json.loads(text)
+            # mapped = list of {idx, category}
+            for m in mapped:
+                idx = int(m.get("idx"))
+                cat = m.get("category") or "Other"
+                if cat not in categories:
+                    cat = "Other"
+                counts[cat] += 1
+                if len(examples[cat]) < 6:
+                    rec = data[idx]
+                    snippet = extract_text_fields(rec)[:300]
+                    examples[cat].append({"idx": idx, "snippet": snippet, "record": rec})
+            return {"counts": dict(counts), "examples": examples}
+        except Exception as e:
+            # fallback to heuristic below
+            print("LLM classification failed, falling back to heuristic:", e)
+
+    # Heuristic (keyword-based) classification
+    for idx, rec in enumerate(data):
+        # prefer explicit Cause field if present and non-empty
+        explicit = (rec.get("Cause") or rec.get("cause") or "").strip()
+        assigned = None
+        if explicit:
+            # try to map explicit value to canonical categories (simple mapping)
+            ex_lower = explicit.lower()
+            # direct matches
+            for cat in categories:
+                if cat.lower() in ex_lower:
+                    assigned = cat
+                    break
+            # some heuristics for common words
+            if not assigned:
+                if any(w in ex_lower for w in ("machin", "equip", "vehicle", "compressor", "diesel")):
+                    assigned = "Machinery Accident"
+                elif any(w in ex_lower for w in ("roof", "fall", "collapse", "inrush", "slip")):
+                    assigned = "Fall of Roof"
+                elif any(w in ex_lower for w in ("elect", "short", "circuit")):
+                    assigned = "Electrical Accident"
+                elif any(w in ex_lower for w in ("explosion", "blast", "gas", "methane", "leak")):
+                    assigned = "Explosion"
+                elif any(w in ex_lower for w in ("fire", "burn")):
+                    assigned = "Fire Incident"
+                elif any(w in ex_lower for w in ("transport", "vehic", "truck", "collision", "trolley")):
+                    assigned = "Transportation Accident"
+        # If not assigned yet, inspect text fields
+        if not assigned:
+            text = extract_text_fields(rec).lower()
+            # check keyword map in order of specificity
+            for kw, cat in keyword_map.items():
+                if kw in text:
+                    assigned = cat
+                    break
+        if not assigned:
+            assigned = "Other"
+
+        counts[assigned] += 1
+        # keep a few representative examples per category
+        if len(examples[assigned]) < 6:
+            snippet = extract_text_fields(rec)[:300]
+            examples[assigned].append({"idx": idx, "snippet": snippet, "record": rec})
+
+    # convert counts to normal dict
+    counts = dict(counts)
+    print(examples)
+    return {"counts": counts, "examples": examples}
 
 
 def classify_by_district(data):
@@ -184,9 +299,9 @@ def api_year():
     return {"data": classify_by_year(data)}
 
 
-# @app.get("/classify_by_cause")
-# def api_cause():
-#     return {"data": classify_by_cause(data)}
+@app.get("/classify_by_cause")
+def api_cause():
+    return {"data": classify_by_cause(data)}
 
 
 @app.get("/classify_by_district")
